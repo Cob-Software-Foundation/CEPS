@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CEP-2: A C API / FFI for Native Cob Extensions</title>
+<style>
+    body {
+        font-family: sans-serif;
+        max-width: 720px;
+        margin: 40px auto;
+        padding: 0 20px;
+        line-height: 1.6;
+        color: #333;
+    }
+    header {
+        border-bottom: 2px solid #333;
+        padding-bottom: 10px;
+        margin-bottom: 20px;
+    }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    .meta { font-size: 14px; color: #555; }
+    .meta div { margin: 2px 0; }
+    .status {
+        display: inline-block;
+        font-weight: bold;
+        font-family: monospace;
+        background: #fff3cd;
+        color: #7a5b00;
+        border: 1px solid #e6c76b;
+        border-radius: 4px;
+        padding: 1px 8px;
+    }
+    h2 {
+        margin-top: 34px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid #ddd;
+        font-size: 19px;
+    }
+    h3 { font-size: 16px; color: #444; }
+    code {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        background: #f2f2f2;
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 0.92em;
+    }
+    pre {
+        background: #f6f6f2;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 12px 16px;
+        overflow-x: auto;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.88em;
+        line-height: 1.5;
+    }
+    pre code { background: none; padding: 0; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; font-size: 0.92em; vertical-align: top; }
+    th { color: #444; }
+    .note {
+        border-left: 3px solid #b8933a;
+        background: #fbf8f0;
+        padding: 10px 14px;
+        margin: 14px 0;
+        font-size: 0.92em;
+    }
+    .nongoal { border-left-color: #b33; background: #fbf0f0; }
+    a { color: #0066cc; }
+</style>
+</head>
+<body>
+
+<header>
+    <h1>CEP-2: A C API / FFI for Native Cob Extensions</h1>
+    <div class="meta">
+        <div><b>CEP:</b> 2</div>
+        <div><b>Title:</b> Introduce a C API / FFI for C-based Packages</div>
+        <div><b>Author:</b> Mohamed</div>
+        <div><b>Status:</b> <span class="status">DRAFT</span></div>
+        <div><b>Created:</b> 17-09-2026</div>
+    </div>
+</header>
+
+<h2>1. Abstract</h2>
+<p>
+    This proposal adds a native C API (<code>cob.h</code>) and a new <code>extern</code>
+    statement so a .cob script can call functions compiled from C (or anything else that can
+    export a C-compatible symbol), and so <code>farmer</code> packages can eventually ship
+    that C code as a native extension. <code>cob_interp</code> loads the extension dynamically
+    at runtime; <code>popcorn_comp</code>, which already transpiles to C and spawns a real C
+    compiler, links against it directly at compile time instead.
+</p>
+
+<h2>2. Motivation</h2>
+<p>
+    Cob's standard interpreter can currently only do what's built into <code>cob_interp.c</code>
+    itself &mdash; SQLite, the native window, and Tcl/Tk (see the v0.0.5 release) all had to be
+    added as new C code and new keywords directly inside the interpreter's own source file, by
+    someone with access to that repository. There is no way for a third party to add a new
+    capability to Cob without a PR against the core interpreter.
+</p>
+<p>
+    A C FFI fixes that: it lets anyone with a C compiler wrap an existing C library, a
+    performance-critical routine, or a hardware/OS-specific facility, and make it callable
+    from a .cob script without touching <code>cob_interp.c</code> at all. Combined with
+    <code>farmer</code>, this is what actually lets a package ecosystem grow past what the
+    two or three people with write access to the core interpreter have time to build in.
+</p>
+
+<h2>3. Specification</h2>
+
+<h3>3.1 The value model this has to bridge</h3>
+<p>
+    Cob has exactly two value kinds today (see v0.0.4's string support): an integer
+    (<code>long</code>) and a string (<code>char*</code>, owned/refcounted by the
+    interpreter). There are no arrays, structs, or function values. The FFI's job in this
+    proposal is only to bridge <em>those two kinds</em> across the C boundary &mdash; not to
+    give Cob arrays or structs, which is a separate, much bigger change and explicitly out of
+    scope here (see 3.5).
+</p>
+
+<h3>3.2 <code>cob.h</code>: one fixed calling convention, not one C signature per function</h3>
+<p>
+    Every native function callable from Cob has to expose <em>exactly the same</em> C
+    signature, regardless of how many arguments it takes or what it does. This is the part of
+    the design that makes the rest of it tractable (see Rationale for why):
+</p>
+<pre><code>/* cob.h -- the only header a native Cob extension needs */
+
+typedef enum { COB_INT, COB_STR } CobValueKind;
+
+typedef struct {
+    CobValueKind kind;
+    union {
+        long        i;   /* COB_INT */
+        const char *s;   /* COB_STR -- NUL-terminated, owned by the caller;
+                             copy it if you need to keep it past this call */
+    } as;
+} CobValue;
+
+/* Every extern function has this exact signature. argv[0..argc-1] are the
+ * arguments as written at the Cob call site, left to right. */
+typedef CobValue (*CobFFIFunc)(CobValue *argv, int argc);
+
+/* Convenience constructors for a native function's return value */
+static inline CobValue cob_int(long v)        { CobValue r; r.kind = COB_INT; r.as.i = v; return r; }
+static inline CobValue cob_str(const char *v)  { CobValue r; r.kind = COB_STR; r.as.s = v; return r; }
+</code></pre>
+<p>
+    A native extension author writes ordinary exported C functions matching
+    <code>CobFFIFunc</code>'s signature, e.g.:
+</p>
+<pre><code>/* math_ext.c -- compiled to math_ext.so / math_ext.dll */
+#include "cob.h"
+
+CobValue calculate_fast(CobValue *argv, int argc) {
+    long x = argv[0].as.i;   /* real code should check argc/kind first */
+    return cob_int(x * x + 1);
+}</code></pre>
+
+<h3>3.3 The <code>extern</code> statement</h3>
+<p>
+    A new statement, one per native function, naming the library it lives in and the C symbol
+    to bind to it:
+</p>
+<pre><code>extern calculate_fast(x) from "math_ext.so"
+
+set result = calculate_fast(42)
+pop(result)</code></pre>
+<p>
+    This is close to the example in the original request, with one deliberate change: there's
+    no separate return-type annotation (the request's <code>logic</code>) written in Cob
+    syntax, because <code>CobValue</code> is already a tagged union &mdash; the native function
+    decides at runtime whether it's handing back an int or a string, the same way
+    <code>sql_query()</code> already does today. Parameter names (<code>x</code> above) are
+    written for readability but carry no type information either, for the same reason: there's
+    nothing to declare, since every argument is already just whichever <code>CobValue</code> it
+    evaluates to.
+</p>
+<p>
+    <code>extern</code> resolves the library and symbol <em>immediately</em>, at the point the
+    statement runs, not lazily on first call:
+</p>
+<table>
+    <tr><th>In <code>cob_interp</code></th><td><code>dlopen()</code>/<code>dlsym()</code> on POSIX, <code>LoadLibraryA()</code>/<code>GetProcAddress()</code> on Windows &mdash; matching the existing <code>#ifdef</code>-per-platform split already used for <code>_cobwindow</code> and <code>popcorn_comp</code>'s Windows quoting fix.</td></tr>
+    <tr><th>If the library or symbol is missing</th><td>a warning is printed and the name is bound to a stub that evaluates to <code>0</code>/<code>""</code> depending on how it's used &mdash; the same "warn and return a harmless default, never crash the interpreter" convention <code>sql_open()</code> and the <code>_cobwindow</code> keywords already use in a build that lacks that feature.</td></tr>
+    <tr><th>In <code>popcorn_comp</code></th><td>emits <code>extern CobValue calculate_fast(CobValue*, int);</code> into the generated C, and passes the library to link against straight to the spawned compiler (<code>-lmath_ext</code>, or the literal path given in the <code>from</code> clause) &mdash; a real static/dynamic link at compile time, no <code>dlopen</code> in the compiled binary at all.</td></tr>
+</table>
+
+<h3>3.4 Cache format impact</h3>
+<p>
+    <code>extern</code> is a new statement kind, so it needs a new entry in
+    <code>StmtKind</code>, a writer/reader pair in the <code>.strawberry</code> cache, and (per
+    the shared-constant fix that came out of the v0.0.5 cycle) a bump of the single
+    <code>STRAWBERRY_MAGIC</code> now centralized in <code>common.h</code>. This proposal
+    explicitly calls that out up front rather than leaving it implicit, since a stale copy of
+    that exact constant in <code>popcorn_comp.c</code> has already caused two real, silent CI
+    failures this project has had to debug &mdash; see the v0.0.5 release notes' "Fixed"
+    section. Any implementation of this CEP should ship the cache-format bump and the
+    <a href="#backward-compat">round-trip test described in 5</a> in the same commit, not as a
+    follow-up.
+</p>
+
+<h3>3.5 Non-goals for this proposal</h3>
+<div class="note nongoal">
+    <ul style="margin:0; padding-left:18px">
+        <li>No arrays, structs, or callback (Cob-function-passed-to-C) support. <code>CobValue</code> stays exactly two kinds, matching Cob's own two value kinds today.</li>
+        <li>No automatic <code>farmer</code> build step for native packages (the original request's point 3). That's a real, separate piece of work &mdash; a package manifest field, a sandboxed build step, per-platform prebuilt binaries or a build-on-install step &mdash; and deserves its own CEP once this one lands, not to be bundled into the same review.</li>
+        <li>No variadic native functions. <code>argc</code> is passed so a native function <em>can</em> accept a variable number of arguments, but the Cob-side call site's arity is fixed by how many arguments are written, unchecked at parse time against what the native function expects.</li>
+    </ul>
+</div>
+
+<h2>4. Rationale</h2>
+
+<h3>Why one fixed <code>CobValue argv[]</code> signature instead of a real native calling convention?</h3>
+<p>
+    The alternative &mdash; generating a distinct C trampoline per distinct argument-count/type
+    signature, or pulling in something like libffi to construct calls at runtime &mdash; is a
+    lot more implementation surface for a language that only has two value kinds to begin with.
+    Using one fixed signature for every extern function is the same choice Lua's
+    <code>lua_CFunction</code>, Python's C API (<code>PyObject* args</code>), and Node's N-API
+    all made, for the same reason: it turns "generate correct calling code for arbitrary
+    signatures" into "generate one call to one function pointer," every time, regardless of
+    arity. The cost is that a native extension author writes a few lines of argument-unpacking
+    boilerplate per function instead of getting native argument types directly &mdash; a
+    reasonable trade for how much simpler it keeps both <code>cob_interp</code> and
+    <code>popcorn_comp</code>'s side of this.
+</p>
+
+<h3>Why does <code>extern</code> resolve eagerly, not on first call?</h3>
+<p>
+    A missing library or misspelled symbol name should fail at the exact line that named it,
+    not at some later, possibly-conditional call site that might not even execute on a given
+    run. This matches the existing "fail clearly and immediately, don't defer to a confusing
+    later symptom" pattern already in this codebase &mdash; <code>--no-gc</code> is refused
+    outright rather than <code>harvest()</code> silently no-oping, for the same reason.
+</p>
+
+<h3>Why does <code>popcorn_comp</code> link statically/dynamically instead of also using <code>dlopen</code> at runtime?</h3>
+<p>
+    <code>popcorn_comp</code> already spawns a real C compiler (Zig's <code>zig cc</code> by
+    default) to produce a genuinely standalone native executable &mdash; that's the entire
+    point of having a native compiler rather than only an interpreter. Making a compiled binary
+    still reach for <code>dlopen</code> at runtime would reintroduce a runtime dependency
+    (the extension's shared library has to be found on disk again, on the end user's machine)
+    that a real link step avoids entirely. <code>cob_interp</code> doesn't have this option
+    &mdash; it has no compile step of its own &mdash; so it's the one side that has to use
+    <code>dlopen</code>/<code>LoadLibrary</code>.
+</p>
+
+<h2 id="backward-compat">5. Backward Compatibility</h2>
+<ul>
+    <li><code>extern</code> is a brand-new keyword with no collision against any existing Cob keyword or identifier rule &mdash; a script that doesn't use it is completely unaffected, in every existing build (<code>cob_interp</code>, <code>cob_interp_window</code>, <code>cob_interp_full</code>, <code>cob_interp_db</code>).</li>
+    <li>The <code>.strawberry</code> cache format needs a version bump (3.4) for the new statement kind. Per the single-source-of-truth fix already in <code>common.h</code>, that's one constant to change, not two &mdash; and this proposal explicitly requires the writer/reader pair and the cache-format bump ship together, with a round-trip test (open a script using <code>extern</code>, run it twice, diff the output) added to CI in the same change, exactly mirroring the test already added for the raygui widget keywords in v0.0.5.</li>
+    <li><code>cob_interp</code> gains a new link dependency on Linux: <code>-ldl</code> for <code>dlopen()</code>/<code>dlsym()</code>. Windows needs nothing extra (<code>LoadLibraryA</code>/<code>GetProcAddress</code> are in <code>kernel32</code>, already linked by default). No new autoconf/configure step is introduced anywhere &mdash; consistent with the project's existing "zero new configure steps" stance from the v0.0.5 cycle.</li>
+    <li><code>popcorn_comp</code> gains new codegen for <code>extern</code>; scripts that don't use it compile exactly as before. A script that does use <code>extern</code> could not previously be compiled by <code>popcorn_comp</code> at all (it wasn't valid syntax), so there's no existing compiled-binary behavior to preserve here &mdash; this is purely additive capability, not a change to any existing one.</li>
+</ul>
+
+</body>
+</html>
